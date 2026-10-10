@@ -1,0 +1,25 @@
+# Géré par Ansible (rôle toad).
+# Partage interne pour transférer fiablement des fichiers volumineux vers
+# KOOPALINGS-CASTLE / DC-BOWSER-KINGDOM (PrintSpoofer, GodPotato, etc.).
+# Toad a banni python3 -m http.server du royaume après l'incident du
+# transfert tronqué à 340 Mo ("Cannot write... (Success)", plus jamais ça).
+#
+# Share exposé UNIQUEMENT sur l'interface interne (bind interfaces only) :
+# aucune route d'exfiltration/infiltration côté DMZ.
+[global]
+   workgroup = MUSHROOMKINGDOM
+   server string = toad-mushroom internal transfer share
+   interfaces = {{ toad_internal_iface }} lo
+   bind interfaces only = yes
+   map to guest = never
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+
+[transfer]
+   path = {{ toad_samba_share_path }}
+   browseable = yes
+   read only = no
+   guest ok = no
+   valid users = {{ toad_samba_user }}
+   create mask = 0644
+   directory mask = 0755

@@ -1,0 +1,6 @@
+<?php
+if (isset($_REQUEST['name']) && $_REQUEST['name'] !== '') { $_SESSION['hero_name'] = $_REQUEST['name']; }
+$title = 'Profil'; include __DIR__ . '/../includes/header.php';
+?>
+<div class="profile-layout"><section class="profile-card"><span class="eyebrow red">CARTE DE HÉROS</span><div class="profile-avatar avatar-mario"><img src="img/Icones/mario.png" alt="Mario"></div><h1><?= $_SESSION['hero_name'] ?? 'Héros sans nom' ?></h1><p class="muted">Membre du Royaume Champignon · niveau recrue</p><div class="profile-stats"><span><b>0</b> quêtes</span><span><b>0</b> badges</span><span><b>∞</b> courage</span></div></section><section class="panel profile-form"><span class="eyebrow">PERSONNALISATION</span><h2>Choisir son nom de héros</h2><p>Ce nom sera affiché dans les discussions et sur ton badge communautaire.</p><form method="post"><label>Nom de héros<input name="name" value="<?= $_SESSION['hero_name'] ?? '' ?>" placeholder="ex. Mario du Royaume" required></label><button class="button button-red">Enregistrer le profil →</button></form><div class="tip">★ Conseil : choisis un nom mémorable, les autres héros le verront partout.</div></section></div>
+<?php include __DIR__ . '/../includes/footer.php'; ?>

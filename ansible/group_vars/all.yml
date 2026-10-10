@@ -1,0 +1,46 @@
+---
+# Variables non sensibles, communes aux rôles. Les secrets vivent dans
+# credentials.yml (chiffré ansible-vault), voir credentials.example.yml.
+
+# --- Réseau ---------------------------------------------------------------
+toad_dmz_iface: ens3
+toad_internal_iface: ens4
+toad_internal_ip: 10.10.20.1
+toad_internal_prefix: 24
+internal_subnet_cidr: 10.10.20.0/24
+
+# --- TOAD-MUSHROOM ----------------------------------------------------------
+# Second disque (DATADISK, ~10G) monté en permanence sur /mnt/data : le
+# disque racine ne fait que 2.4G et est déjà presque saturé par l'OS seul
+# (constaté : 100% plein avec le webroot sur /var). Tout ce qui est amené à
+# grossir (webroot applicatif, partage Samba) vit donc sur ce second disque.
+toad_data_disk_uuid: "8ce94f5e-bf05-445f-b82b-9b0c8fe60841"
+toad_data_mount: /mnt/data
+
+toad_webroot: "{{ toad_data_mount }}/www/mission-board"
+toad_samba_share_path: "{{ toad_data_mount }}/samba/transfer"
+
+# Seul compte valide du Mission Board : celui que Captain Toad "laisse
+# fuiter" dans le chat quand on lui parle d'un flag (assets/js/app.js). Les
+# inscriptions sont désactivées (pages/login.php) -> c'est le SEUL moyen
+# légitime d'obtenir un accès. Le fil du forum ("maintenance.toad" /
+# "1UP-MUSHROOM-BOARD") reste un second honeypot, volontairement NON
+# fonctionnel, pour brouiller les pistes.
+mkb_honeypot_username: backup.koopa@mushroomkingdom.local
+mkb_honeypot_password: GOOMBA-STOMP-1996
+
+# Port DNS alternatif pour forum.mushroomkingdom.local : le port 53 standard est
+# intercepté par l'infra réseau CloudStack avant d'atteindre la VM (testé,
+# confirmé : réponse bidon façon résolveur public même en frappant l'IP DMZ
+# directement). L'auditeur doit scanner tous les ports pour le découvrir.
+toad_dns_port: 5353
+
+# --- KOOPALINGS-CASTLE ------------------------------------------------------
+koopalings_site_path: C:\inetpub\koopalings-castle
+koopalings_svc_account_fqdn: MUSHROOMKINGDOM\svc_bowser_jr
+
+# --- DC-BOWSER-KINGDOM -------------------------------------------------------
+ad_domain_dn_part1: mushroomkingdom
+ad_domain_dn_part2: local
+bowser_admin_sam: bowser_admin
+bowser_admin_fqdn: MUSHROOMKINGDOM\bowser_admin

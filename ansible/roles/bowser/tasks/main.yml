@@ -1,0 +1,172 @@
+---
+# DC-BOWSER-KINGDOM : le donjon final. La promotion AD DS est déjà faite à
+# la main — ce rôle ne fait QUE de la vérification/durcissement (jamais de
+# recréation du domaine) + le dépôt du compte DA équivalent et du flag.
+#
+# Histoire : Bowser a confié les clés du donjon à "bowser_admin", son
+# administrateur système, trop pressé de partir en week-end au Royaume
+# Champignon voisin pour vérifier qu'il s'était bien déconnecté de
+# KOOPALINGS-CASTLE après sa dernière intervention.
+
+# --- Compte de service svc_bowser_jr (déjà créé à la main) ----------------
+# On force le mot de passe à la valeur de credentials.yml à chaque run :
+# c'est la seule façon fiable de garder le pool IIS de KOOPALINGS-CASTLE et
+# l'objet AD synchronisés (il n'existe pas de moyen de "lire" un mot de
+# passe existant pour comparer avant d'agir -> ce module remonte donc
+# "changed" à chaque exécution, c'est attendu, pas un bug d'idempotence).
+- name: Mot de passe svc_bowser_jr aligné sur credentials.yml
+  microsoft.ad.user:
+    name: "{{ svc_bowser_jr_user }}"
+    password: "{{ svc_bowser_jr_password }}"
+    update_password: always
+    password_never_expires: true
+    enabled: true
+    state: present
+  no_log: true
+  tags: [bowser, koopalings, deploy]
+
+# --- Compte Domain Admin équivalent, planté volontairement ---------------
+- name: Compte bowser_admin (équivalent Domain Admin)
+  microsoft.ad.user:
+    name: "{{ bowser_admin_sam }}"
+    firstname: Bowser
+    surname: Admin
+    password: "{{ bowser_admin_password }}"
+    password_never_expires: true
+    enabled: true
+    state: present
+    groups:
+      add:
+        - "Domain Admins"
+  no_log: true
+  tags: [bowser, deploy]
+
+# --- Durcissement de vérification (ne recrée rien) ------------------------
+- name: Vérifier ms-DS-MachineAccountQuota=0
+  microsoft.ad.object:
+    identity: "DC={{ ad_domain_dn_part1 }},DC={{ ad_domain_dn_part2 }}"
+    type: domainDNS # objet déjà existant (racine du domaine) ; jamais créé par ce rôle
+    attributes:
+      set:
+        ms-DS-MachineAccountQuota: 0
+  tags: [bowser, hardening]
+
+- name: SMB signing requis (serveur)
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters
+    name: RequireSecuritySignature
+    data: 1
+    type: dword
+    state: present
+  tags: [bowser, hardening]
+
+- name: SMB signing requis (client)
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\LanManWorkstation\Parameters
+    name: RequireSecuritySignature
+    data: 1
+    type: dword
+    state: present
+  tags: [bowser, hardening]
+
+- name: Rechercher des comptes AS-REP rôtables (DONT_REQ_PREAUTH)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $accs = Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true} -Properties DoesNotRequirePreAuth |
+      Select-Object -ExpandProperty SamAccountName
+    if ($accs) { Write-Output ($accs -join ",") } else { Write-Output "NONE" }
+  register: asrep_accounts
+  changed_when: false
+  tags: [bowser, hardening]
+
+- name: Alerter si des comptes AS-REP rôtables existent (hors prévu)
+  debug:
+    msg: >-
+      ATTENTION : comptes AS-REP rôtables détectés : {{ asrep_accounts.stdout_lines[0] }}.
+      Vérifier qu'ils sont prévus dans le write-up avant la session.
+  when: asrep_accounts.stdout_lines[0] != "NONE"
+  tags: [bowser, hardening]
+
+- name: Rechercher un cpassword GPP résiduel dans SYSVOL
+  ansible.windows.win_shell: |
+    $hits = Get-ChildItem -Path "C:\Windows\SYSVOL\domain\Policies" -Recurse -Include *.xml -ErrorAction SilentlyContinue |
+      Select-String -Pattern "cpassword" -ErrorAction SilentlyContinue
+    if ($hits) { Write-Output "FOUND" } else { Write-Output "NONE" }
+  register: gpp_cpassword
+  changed_when: false
+  tags: [bowser, hardening]
+
+- name: Alerter si un cpassword GPP traîne dans SYSVOL (hors prévu)
+  debug:
+    msg: "ATTENTION : cpassword trouvé dans SYSVOL — vulnérabilité non prévue par ce lab, à nettoyer."
+  when: gpp_cpassword.stdout_lines[0] == "FOUND"
+  tags: [bowser, hardening]
+
+- name: Rechercher une délégation non contrainte imprévue
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $dcNames = (Get-ADDomainController -Filter *).Name
+    $comps = Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation |
+      Where-Object { $_.Name -notin $dcNames } |
+      Select-Object -ExpandProperty Name
+    if ($comps) { Write-Output ($comps -join ",") } else { Write-Output "NONE" }
+  register: unconstrained_delegation
+  changed_when: false
+  tags: [bowser, hardening]
+
+- name: Alerter si une délégation non contrainte imprévue existe
+  debug:
+    msg: >-
+      ATTENTION : délégation non contrainte imprévue sur : {{ unconstrained_delegation.stdout_lines[0] }}.
+  when: unconstrained_delegation.stdout_lines[0] != "NONE"
+  tags: [bowser, hardening]
+
+# --- Hygiène : aucune trace de nos propres commandes de setup/test --------
+- name: Purger les historiques PowerShell déjà écrits pendant nos tests
+  ansible.windows.win_shell: |
+    Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+      $f = Join-Path $_.FullName "AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+      if (Test-Path $f) { Remove-Item $f -Force }
+    }
+  changed_when: false
+  tags: [bowser, deploy]
+
+- name: Désactiver l'historique PowerShell pour toutes les sessions futures
+  ansible.windows.win_shell: |
+    $profilePath = "$PSHOME\Profile.ps1"
+    $line = "try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch {}"
+    if (-not (Test-Path $profilePath) -or -not (Select-String -Path $profilePath -Pattern "HistorySaveStyle" -Quiet)) {
+      Add-Content -Path $profilePath -Value $line
+      Write-Output "ajouté"
+    } else {
+      Write-Output "déjà présent"
+    }
+  register: histdisable
+  changed_when: "'ajouté' in histdisable.stdout"
+  tags: [bowser, deploy]
+
+# --- Flag final ------------------------------------------------------------
+- name: Dossier Desktop de bowser_admin existe (profil pré-créé)
+  ansible.windows.win_shell: |
+    $profilePath = "C:\Users\{{ bowser_admin_sam }}\Desktop"
+    New-Item -ItemType Directory -Force -Path $profilePath | Out-Null
+    Write-Output $profilePath
+  register: desktop_path
+  changed_when: false
+  tags: [bowser, deploy]
+
+- name: Déposer le flag final sur le Bureau de bowser_admin
+  ansible.windows.win_copy:
+    dest: "C:\\Users\\{{ bowser_admin_sam }}\\Desktop\\flag.txt"
+    content: |
+      Chemin d'exploitation attendu (a documenter dans le write-up auteur) :
+        1. LFI + wrapper data:// (allow_url_include) sur le Mission Board (TOAD) -> RCE www-data
+        2. Privesc Linux via coffre KeePass faible (/var/backups) -> mdp toadette -> sudo vim (GTFOBins) -> root
+        3. Lecture de /root/castle_access.txt -> identifiants svc_bowser_jr
+        4. Upload non restreint (upload.aspx, KOOPALINGS-CASTLE) -> RCE sous le pool
+        5. SeImpersonatePrivilege -> SYSTEM (PrintSpoofer/GodPotato)
+        6. Dump LSASS (WDigest actif) -> identifiants bowser_admin en clair
+        7. Authentification bowser_admin sur DC-BOWSER-KINGDOM (Domain Admin)
+
+      FLAG{s0rry_m4r10_y0ur_pr1nc3ss_1s_1n_4n0th3r_c4stl3}
+  tags: [bowser, deploy]

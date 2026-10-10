@@ -1,0 +1,296 @@
+---
+# KOOPALINGS-CASTLE : IIS + pool applicatif svc_bowser_jr + upload non
+# restreint. Membre du domaine mushroomkingdom.local (joint manuellement).
+
+- name: Rôle IIS (Web-Server + ASP.NET) présent
+  ansible.windows.win_feature:
+    name:
+      - Web-Server
+      - Web-Asp-Net45
+      - Web-Mgmt-Console
+    state: present
+  tags: [koopalings, deploy]
+
+# Requis AVANT de démarrer le pool : quand l'identité d'un App Pool est
+# définie via WMI/PowerShell (plutôt que depuis l'UI IIS Manager, qui
+# l'accorde automatiquement), le compte n'a pas le droit "Log on as a batch
+# job" (SeBatchLogonRight) -> WAS échoue à démarrer le worker process avec
+# "the application pool identity is invalid".
+- name: Droit "Log on as a batch job" pour svc_bowser_jr
+  ansible.windows.win_user_right:
+    name: SeBatchLogonRight
+    users:
+      - "{{ koopalings_svc_account_fqdn }}"
+    action: add
+  tags: [koopalings, deploy]
+
+- name: Application Pool KoopalingsPool
+  community.windows.win_iis_webapppool:
+    name: KoopalingsPool
+    state: started
+    attributes:
+      managedRuntimeVersion: v4.0
+      processModel.identityType: SpecificUser
+      processModel.userName: "{{ koopalings_svc_account_fqdn }}"
+      processModel.password: "{{ koopalings_svc_account_password }}"
+  no_log: true
+  tags: [koopalings, deploy]
+
+- name: Dossier du site
+  ansible.windows.win_file:
+    path: "{{ koopalings_site_path }}"
+    state: directory
+  tags: [koopalings, deploy]
+
+- name: Dossier uploads/ (accessible en écriture à l'identité du pool — faille voulue)
+  ansible.windows.win_file:
+    path: "{{ koopalings_site_path }}\\uploads"
+    state: directory
+  tags: [koopalings, deploy]
+
+- name: ACL en écriture pour svc_bowser_jr sur uploads/
+  ansible.windows.win_acl:
+    path: "{{ koopalings_site_path }}\\uploads"
+    user: "{{ koopalings_svc_account_fqdn }}"
+    rights: Modify
+    type: allow
+    state: present
+    inherit: ContainerInherit, ObjectInherit
+  tags: [koopalings, deploy]
+
+- name: "Déployer upload.aspx (vulnérabilité volontaire : pas de filtre d'extension)"
+  ansible.windows.win_template:
+    src: upload.aspx.j2
+    dest: "{{ koopalings_site_path }}\\upload.aspx"
+  tags: [koopalings, deploy]
+
+- name: Déployer web.config
+  ansible.windows.win_template:
+    src: web.config.j2
+    dest: "{{ koopalings_site_path }}\\web.config"
+  tags: [koopalings, deploy]
+
+- name: Supprimer le site IIS "Default Web Site" s'il traîne encore
+  # Doit être fait AVANT de créer KoopalingsCastle : les deux ne peuvent pas
+  # coexister sur le même binding (*:80).
+  community.windows.win_iis_website:
+    name: Default Web Site
+    state: absent
+  tags: [koopalings, deploy]
+
+- name: Site IIS KoopalingsCastle lié au pool
+  community.windows.win_iis_website:
+    name: KoopalingsCastle
+    state: started
+    physical_path: "{{ koopalings_site_path }}"
+    application_pool: KoopalingsPool
+    port: 80
+  tags: [koopalings, deploy]
+
+# --- Pare-feu : seul 80/tcp entrant, interface interne -------------------
+- name: Règle pare-feu entrante 80/tcp (interne uniquement)
+  community.windows.win_firewall_rule:
+    name: Koopalings Castle - HTTP interne
+    localport: 80
+    action: allow
+    direction: in
+    protocol: tcp
+    profiles: domain
+    remoteip: "{{ internal_subnet_cidr }}"
+    state: present
+    enabled: true
+  tags: [koopalings, deploy]
+
+# Recyclage forcé : si le mot de passe AD de svc_bowser_jr a changé depuis
+# la dernière fois que WAS a démarré le worker process (ex. rôle bowser
+# rejoué après celui-ci, ou dérive manuelle corrigée), IIS garde l'ancien
+# pool en échec ("identity is invalid") jusqu'à un restart explicite — un
+# simple state:started ne suffit pas à le détecter. On force donc un
+# cycle stop/start à chaque exécution pour que le site serve réellement.
+- name: Recycler KoopalingsPool pour appliquer une éventuelle nouvelle identité
+  # WAS peut renvoyer "service cannot accept control messages" juste après
+  # une modification de config (ex. (re)création du site juste avant) : on
+  # retente avec un délai, ce n'est pas un échec réel.
+  ansible.windows.win_shell: |
+    Import-Module WebAdministration
+    Stop-WebAppPool -Name KoopalingsPool -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Start-WebAppPool -Name KoopalingsPool
+  changed_when: true
+  retries: 5
+  delay: 5
+  register: koopalings_recycle
+  until: koopalings_recycle.rc == 0
+  tags: [koopalings, deploy]
+
+- name: Vérifier que le site répond (non intrusif, ne fait que lire le code HTTP)
+  ansible.windows.win_shell: |
+    try {
+      (Invoke-WebRequest -Uri http://localhost/upload.aspx -UseBasicParsing -TimeoutSec 10).StatusCode
+    } catch {
+      $_.Exception.Response.StatusCode.value__
+    }
+  register: koopalings_http_check
+  changed_when: false
+  tags: [koopalings, deploy]
+
+- name: Alerter si le site ne répond pas en 200
+  debug:
+    msg: >-
+      ATTENTION : http://localhost/upload.aspx sur KOOPALINGS-CASTLE a répondu
+      {{ koopalings_http_check.stdout_lines[0] }} au lieu de 200. Vérifier le
+      mot de passe svc_bowser_jr (rôle bowser) et les logs WAS.
+  when: koopalings_http_check.stdout_lines[0] | trim != "200"
+  tags: [koopalings, deploy]
+
+# --- Script de vérification (non intrusif) -------------------------------
+- name: C:\Scripts existe
+  ansible.windows.win_file:
+    path: C:\Scripts
+    state: directory
+  tags: [koopalings, deploy]
+
+- name: Script de vérification SeImpersonatePrivilege / non-admin
+  ansible.windows.win_template:
+    src: verify-privesc.ps1.j2
+    dest: "C:\\Scripts\\verify-privesc.ps1"
+  tags: [koopalings, deploy]
+
+- name: Exécuter le script de vérification
+  ansible.windows.win_shell: C:\Scripts\verify-privesc.ps1
+  register: verify_output
+  changed_when: false
+  tags: [koopalings, deploy]
+
+- name: Afficher le résultat de la vérification
+  debug:
+    var: verify_output.stdout_lines
+  tags: [koopalings, deploy]
+
+# --- Transfert des outils de test (PrintSpoofer/GodPotato) via Samba -----
+# Les binaires doivent avoir été déposés au préalable par l'auteur dans
+# {{ toad_samba_share_path }}/tools/ sur TOAD (téléchargés depuis la DMZ,
+# jamais directement sur une machine sans accès Internet).
+- name: "Monter le partage interne de TOAD (lecteur temporaire Z:)"
+  ansible.windows.win_shell: |
+    net use Z: \\{{ toad_internal_ip }}\transfer /user:{{ toad_samba_user }} "{{ toad_samba_password }}" /persistent:no
+  changed_when: true
+  tags: [koopalings, tools]
+
+- name: "C:\\Tools existe"
+  ansible.windows.win_file:
+    path: C:\Tools
+    state: directory
+  tags: [koopalings, tools]
+
+- name: "Copier PrintSpoofer/GodPotato depuis Z:\\tools vers C:\\Tools"
+  ansible.windows.win_shell: |
+    if (Test-Path "Z:\tools") {
+      Copy-Item -Path "Z:\tools\*" -Destination "C:\Tools" -Force -Recurse
+      Write-Output "Outils copiés."
+    } else {
+      Write-Output "Aucun outil trouvé sur le partage (Z:\tools absent) — dépose-les sur TOAD avant de rejouer ce rôle si besoin."
+    }
+  register: tools_copy
+  changed_when: "'copiés' in tools_copy.stdout"
+  tags: [koopalings, tools]
+
+- name: "Démonter le lecteur Z:"
+  ansible.windows.win_shell: "net use Z: /delete /y"
+  changed_when: true
+  failed_when: false
+  tags: [koopalings, tools]
+
+# --- Amorce "credentials en cache" pour le pivot vers le DC --------------
+# Scénario : bowser_admin (compte équivalent Domain Admin, voir rôle bowser)
+# vient "régulièrement faire la maintenance" sur KOOPALINGS-CASTLE via une
+# tâche planifiée interactive. Avec WDigest activé, son mot de passe reste
+# récupérable en clair depuis LSASS (ex. mimikatz sekurlsa::logonpasswords)
+# tant que la tâche a tourné au moins une fois depuis le dernier reboot.
+# Chemin d'exploitation : SYSTEM sur KOOPALINGS (via upload.aspx +
+# SeImpersonatePrivilege) -> dump LSASS -> credentials bowser_admin en clair
+# -> authentification directe sur DC-BOWSER-KINGDOM.
+- name: Activer WDigest (UseLogonCredential=1) — amorce volontaire du lab
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest
+    name: UseLogonCredential
+    data: 1
+    type: dword
+    state: present
+  tags: [koopalings, deploy]
+
+- name: Tâche planifiée de "maintenance" exécutée par bowser_admin
+  ansible.windows.win_shell: |
+    $taskName = "Koopalings Castle - Maintenance mensuelle"
+    schtasks /query /tn "$taskName" > $null 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      schtasks /create /tn "$taskName" /tr "cmd.exe /c echo maintenance" /sc HOURLY /mo 1 /ru "{{ bowser_admin_fqdn }}" /rp "{{ bowser_admin_password }}" /rl HIGHEST /it /f
+      schtasks /run /tn "$taskName"
+      Write-Output "Tâche créée et exécutée une première fois."
+    } else {
+      schtasks /run /tn "$taskName"
+      Write-Output "Tâche déjà présente, relancée pour rafraîchir le cache LSASS."
+    }
+  register: maint_task
+  changed_when: "'créée' in maint_task.stdout"
+  no_log: true
+  tags: [koopalings, deploy]
+
+# --- Hygiène : aucune trace de nos propres commandes de setup/test --------
+- name: Purger les historiques PowerShell déjà écrits pendant nos tests
+  ansible.windows.win_shell: |
+    Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+      $f = Join-Path $_.FullName "AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+      if (Test-Path $f) { Remove-Item $f -Force }
+    }
+  changed_when: false
+  tags: [koopalings, deploy]
+
+- name: Désactiver l'historique PowerShell pour toutes les sessions futures
+  ansible.windows.win_shell: |
+    $profilePath = "$PSHOME\Profile.ps1"
+    $line = "try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch {}"
+    if (-not (Test-Path $profilePath) -or -not (Select-String -Path $profilePath -Pattern "HistorySaveStyle" -Quiet)) {
+      Add-Content -Path $profilePath -Value $line
+      Write-Output "ajouté"
+    } else {
+      Write-Output "déjà présent"
+    }
+  register: histdisable
+  changed_when: "'ajouté' in histdisable.stdout"
+  tags: [koopalings, deploy]
+
+# --- Verrouillage avant session d'examen ---------------------------------
+# NOTE : une règle de pare-feu "Block" seule s'est révélée insuffisante ici
+# (la règle intégrée "Windows Remote Management (HTTP-In)", probablement
+# renforcée par la stratégie de groupe du domaine, continue de laisser
+# passer le trafic malgré un Block local). On coupe donc directement le
+# service WinRM, qui est la seule garantie fiable que personne (y compris
+# un attaquant root sur TOAD avec les creds de castle_access.txt) ne peut
+# plus s'y connecter. Conséquence assumée : Ansible ne pourra plus gérer
+# cette machine en WinRM après ce tag, il faudra repasser par la console
+# CloudStack pour le réactiver (`Start-Service WinRM` + `Set-Service WinRM
+# -StartupType Automatic`) avant le prochain redéploiement.
+- name: "[lockdown] Arrêter et désactiver le service WinRM"
+  ansible.windows.win_service:
+    name: WinRM
+    state: stopped
+    start_mode: disabled
+  tags: [lockdown]
+
+- name: "[lockdown] Fermer 5985/5986 en entrée (ceinture et bretelles)"
+  community.windows.win_firewall_rule:
+    name: "{{ item.name }}"
+    action: block
+    direction: in
+    protocol: tcp
+    localport: "{{ item.port }}"
+    profiles: domain, private, public
+    state: present
+    enabled: true
+  loop:
+    - { name: "WinRM HTTP - lockdown", port: 5985 }
+    - { name: "WinRM HTTPS - lockdown", port: 5986 }
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [lockdown]

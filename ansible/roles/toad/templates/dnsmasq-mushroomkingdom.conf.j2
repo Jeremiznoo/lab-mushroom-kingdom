@@ -1,0 +1,41 @@
+# Géré par Ansible (rôle toad). Mini-DNS autoritaire pour mushroomkingdom.local
+# — pas un résolveur ouvert : interrogeable uniquement sur ens3 (DMZ), ne
+# transmet (forward) aucune requête vers l'extérieur, ne répond QUE pour
+# cette zone.
+#
+# Port {{ toad_dns_port }} et NON 53 : le port 53 "standard" est intercepté
+# par l'infrastructure réseau CloudStack avant d'atteindre cette VM (le
+# routeur virtuel répond à sa place, hors de notre contrôle — cf.
+# voir README du lab).
+#
+# Conception volontaire à deux niveaux pour forcer une vraie énumération :
+#   - l'apex "mushroomkingdom.local" résout (A + PTR automatique) : c'est ce
+#     que révèle une résolution DNS inverse (PTR) sur l'IP de TOAD.
+#   - SEUL le sous-domaine "forum.mushroomkingdom.local" résout en plus
+#     (A, sans PTR concurrent) : l'auditeur doit le trouver par énumération
+#     de sous-domaines (wordlist subdomains-*, ex. SecLists) — en DNS
+#     (brute-force de noms contre ce serveur) ou en HTTP (vhost fuzzing sur
+#     le Host, cf. vhost Apache). N'importe quel autre sous-domaine renvoie
+#     NXDOMAIN : pas de wildcard, l'énumération doit être réelle.
+interface={{ toad_dmz_iface }}
+interface=lo
+bind-interfaces
+
+# Pas de résolveur récursif/forwarder : uniquement autoritaire sur sa zone.
+no-resolv
+no-poll
+domain-needed
+bogus-priv
+
+# Apex : A + PTR automatique (révélé par une résolution inverse de l'IP).
+host-record=mushroomkingdom.local,{{ ansible_facts['ens3']['ipv4']['address'] }}
+
+# Sous-domaine caché : A seulement (pas de PTR concurrent), à découvrir par
+# énumération. Aucun autre sous-domaine ne résout (pas de wildcard).
+address=/forum.mushroomkingdom.local/{{ ansible_facts['ens3']['ipv4']['address'] }}
+
+# Pas de DHCP ici, uniquement le service DNS.
+no-dhcp-interface={{ toad_dmz_iface }}
+port={{ toad_dns_port }}
+log-queries
+log-facility=/var/log/dnsmasq-mushroomkingdom.log

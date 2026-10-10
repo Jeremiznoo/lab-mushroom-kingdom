@@ -1,0 +1,41 @@
+#!/usr/sbin/nft -f
+# Géré par Ansible (rôle toad). Toad garde l'entrée du royaume :
+# seuls le panneau de quêtes (80/tcp), le DNS de forum.mushroomkingdom.local sur un
+# port NON standard ({{ toad_dns_port }}/tcp+udp — le port 53 "normal" est
+# intercepté par l'infra réseau CloudStack avant d'atteindre la VM, hors de
+# notre contrôle) et la porte de service (22/tcp) sont ouverts côté DMZ
+# (ens3). Le site n'est servi que pour le Host "forum.mushroomkingdom.local" (vhost
+# Apache) : un accès direct par IP ne montre rien d'intéressant -> l'auditeur
+# doit scanner, trouver ce port DNS alternatif, puis résoudre le nom
+# lui-même. Côté château (ens4), tout le monde circule librement — c'est un
+# réseau "interne de confiance" pour ce lab.
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # DMZ (ens3) : site public (via vhost) + DNS (port alternatif) + SSH d'admin seulement.
+        iif "{{ toad_dmz_iface }}" tcp dport { 22, {{ toad_dns_port }}, 80 } accept
+        iif "{{ toad_dmz_iface }}" udp dport {{ toad_dns_port }} accept
+        iif "{{ toad_dmz_iface }}" icmp type echo-request accept
+
+        # Interne (ens4) : trafic libre vers/depuis le château.
+        iif "{{ toad_internal_iface }}" accept
+    }
+
+    chain forward {
+        # Toad ne route rien entre DMZ et interne : pas de royaume-passerelle
+        # gratuit pour l'attaquant. net.ipv4.ip_forward=0 fait déjà le travail,
+        # cette règle est une ceinture-et-bretelles.
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}

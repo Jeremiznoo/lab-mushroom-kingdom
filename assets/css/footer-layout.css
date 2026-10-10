@@ -1,0 +1,4 @@
+.page-shell{padding-bottom:110px}.site-footer{position:fixed;left:0;right:0;bottom:0;z-index:18;box-shadow:0 -5px 18px #17253c18}
+.support-tile{bottom:67px;right:24px}
+.support-chat{bottom:67px}
+@media(max-width:520px){.site-footer{font-size:9px}.support-tile{bottom:62px;right:10px}.support-chat{bottom:62px}}

@@ -1,0 +1,45 @@
+all:
+  children:
+    linux:
+      hosts:
+        toad-mushroom:
+          # Seule machine joignable depuis l'extérieur : interface DMZ ens3,
+          # IP DHCP -> renseigner {{ toad_dmz_ip }} (group_vars) avant de jouer.
+          ansible_host: "{{ toad_dmz_ip }}"
+          ansible_user: ubuntu
+          ansible_become: true
+          ansible_become_method: sudo
+          ansible_connection: ssh
+          # Clé privée : ne pas committer de chemin personnel ici. Passer
+          # --private-key ~/chemin/vers/id_rsa.key en ligne de commande, ou
+          # définir ansible_ssh_private_key_file dans un group_vars local
+          # non versionné (ex. group_vars/credentials.yml).
+
+    windows:
+      # KOOPALINGS-CASTLE et DC-BOWSER-KINGDOM n'ont pas de gateway et ne
+      # sont routables que depuis l'interne (ens4 de TOAD). Le contrôleur
+      # Ansible ne tourne PAS sur TOAD (voir README) : on atteint WinRM via
+      # un tunnel SSH local établi au travers de TOAD, par ex. :
+      #
+      #   ssh -N \
+      #     -L 15985:10.10.20.20:5985 \
+      #     -L 15986:10.10.20.30:5985 \
+      #     -i <ta clé privée> ubuntu@{{ toad_dmz_ip }}
+      #
+      # ... à lancer dans un terminal séparé avant `ansible-playbook`
+      # (ou en arrière-plan, détaché : ajouter `&disown` ou `nohup`).
+      vars:
+        ansible_connection: winrm
+        ansible_winrm_transport: ntlm
+        ansible_winrm_scheme: http   # port 5985 = HTTP ; 5986 serait HTTPS
+        ansible_winrm_server_cert_validation: ignore
+        ansible_host: 127.0.0.1
+      hosts:
+        koopalings-castle:
+          ansible_port: 15985
+          ansible_user: "{{ koopalings_admin_user }}"
+          ansible_password: "{{ koopalings_admin_password }}"
+        dc-bowser-kingdom:
+          ansible_port: 15986
+          ansible_user: "{{ bowser_admin_bootstrap_user }}"
+          ansible_password: "{{ bowser_admin_bootstrap_password }}"

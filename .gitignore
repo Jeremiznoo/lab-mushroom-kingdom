@@ -1,0 +1,24 @@
+# Secrets
+ansible/group_vars/credentials.yml
+*.vault_pass
+.vault_pass
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Ansible
+*.retry
+
+# Docs internes
+docs/compte-rendu-codex.md
+
+# Archives
+*.tar.gz
+*.zip

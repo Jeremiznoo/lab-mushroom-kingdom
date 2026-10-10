@@ -1,0 +1,27 @@
+# Géré par Ansible (rôle koopalings).
+# Script de vérification (NON destructif) : confirme que la chaîne de
+# privesc voulue est bien en place, sans jamais l'exploiter.
+#   1. svc_bowser_jr possède SeImpersonatePrivilege (via IIS_IUSRS).
+#   2. svc_bowser_jr n'est PAS membre de BUILTIN\Administrators.
+
+$ErrorActionPreference = "Stop"
+$identity = "{{ koopalings_svc_account_fqdn }}"
+
+Write-Host "== Vérification SeImpersonatePrivilege pour $identity =="
+$iisIusrsMembers = Get-LocalGroupMember -Group "IIS_IUSRS" -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty Name
+if ($iisIusrsMembers -contains $identity) {
+    Write-Host "[OK] $identity est membre de IIS_IUSRS (hérite SeImpersonatePrivilege)."
+} else {
+    Write-Warning "[KO] $identity n'est PAS membre de IIS_IUSRS. L'App Pool doit normalement l'y ajouter automatiquement au premier démarrage."
+}
+
+Write-Host "`n== Vérification absence de $identity dans BUILTIN\Administrators =="
+$admins = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty Name
+if ($admins -contains $identity) {
+    Write-Warning "[KO] $identity EST membre d'Administrators locaux ! Vulnérabilité excessive non prévue, à corriger."
+    exit 1
+} else {
+    Write-Host "[OK] $identity n'est pas administrateur local (privesc doit passer par SeImpersonatePrivilege)."
+}

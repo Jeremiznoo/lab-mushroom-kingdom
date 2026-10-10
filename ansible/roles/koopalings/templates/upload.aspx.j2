@@ -1,0 +1,56 @@
+<%@ Page Language="C#" %>
+<%--
+  Intranet des Koopalings - "Castle File Drop"
+  Codé par le cousin de Lemmy en un week-end ("ça marche sur ma machine").
+  Aucune vérification d'extension, de content-type ni de magic bytes : la
+  vulnérabilité volontaire du lab. Les fichiers atterrissent dans uploads/,
+  servi par le même pool applicatif -> tout .aspx déposé ici s'exécute sous
+  l'identité MUSHROOMKINGDOM\svc_bowser_jr.
+--%>
+<%@ Import Namespace="System.IO" %>
+<script runat="server">
+    protected void Page_Load(object sender, EventArgs e)
+    {
+        if (Request.HttpMethod == "POST" && Request.Files.Count > 0)
+        {
+            HttpPostedFile f = Request.Files[0];
+            if (f != null && f.ContentLength > 0)
+            {
+                string uploadsDir = Server.MapPath("~/uploads");
+                string dest = Path.Combine(uploadsDir, Path.GetFileName(f.FileName));
+                f.SaveAs(dest); // aucun filtre d'extension : la faille voulue
+                Response.Write("Fichier deposé : /uploads/" + Server.HtmlEncode(Path.GetFileName(f.FileName)));
+            }
+        }
+    }
+</script>
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Castle File Drop</title>
+  <style>
+    :root{--ink:#2a1718;--muted:#80666a;--red:#b93432;--deep:#38191d;--gold:#ffc84b;--cream:#fff8ee;--line:#efd5c3}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;color:var(--ink);font-family:Arial,Helvetica,sans-serif;background:var(--cream) url('/assets/background-lava.png') center/cover fixed no-repeat}
+    body:before{content:'';position:fixed;inset:0;background:linear-gradient(135deg,#ffbd6840,#5b181c70);z-index:-1}.top{position:fixed;top:0;left:0;right:0;height:34px;padding:10px 24px;background:var(--deep);color:#ffd6af;font-size:11px;font-weight:bold;letter-spacing:.08em}.top span{float:right;color:var(--gold)}
+    .card{width:min(92vw,470px);padding:32px;border:5px solid #fff;border-radius:24px;background:#fffdf9ee;box-shadow:0 20px 55px #42111655;text-align:center}.logo{width:82px;height:82px;margin:0 auto 18px;padding:9px;border-radius:24px;background:var(--red);box-shadow:0 6px 0 #751f25}.logo img{width:100%;height:100%;object-fit:contain}.eyebrow{color:var(--red);font-size:10px;font-weight:bold;letter-spacing:.16em}.card h1{margin:10px 0 7px;font-size:28px;letter-spacing:-.04em}.card p{margin:0 auto 22px;color:var(--muted);font-size:13px;line-height:1.5}.dropzone{padding:19px;border:2px dashed #dda889;border-radius:13px;background:#fff8ef;text-align:left}.dropzone label{display:block;margin-bottom:7px;color:#684d50;font-size:11px;font-weight:bold}.dropzone input[type=file]{width:100%;font:inherit;font-size:11px}.button{width:100%;margin-top:17px;padding:13px;border:0;border-radius:10px;background:var(--red);color:#fff;font:inherit;font-size:12px;font-weight:bold;cursor:pointer;box-shadow:0 4px 0 #781f26}.button:hover{transform:translateY(-2px)}.note{margin-top:17px;color:#9a7166;font-size:10px}.back{display:inline-block;margin-top:18px;color:var(--red);font-size:11px;font-weight:bold}.back:hover{text-decoration:underline}
+    @media(max-width:520px){.top{padding-left:14px;padding-right:14px}.top span{display:none}.card{padding:25px 20px}.card h1{font-size:25px}}
+  </style>
+</head>
+<body>
+  <div class="top">KOOPALINGS-CASTLE &middot; CASTLE FILE DROP <span>&bull; ZONE INTERNE</span></div>
+  <main class="card">
+    <div class="logo"><img src="/assets/bowser-icon.png" alt="Bowser"></div>
+    <span class="eyebrow">TRANSMISSION DU CH&Acirc;TEAU</span>
+    <h1>Castle File Drop</h1>
+    <p>D&eacute;pose les notes de garde, plannings et rapports destin&eacute;s aux membres du ch&acirc;teau.</p>
+    <form method="post" enctype="multipart/form-data" runat="server">
+      <div class="dropzone"><label for="castleFile">Fichier &agrave; transmettre</label><input id="castleFile" type="file" name="file" runat="server"></div>
+      <input class="button" type="submit" value="D&eacute;poser le fichier &rarr;">
+    </form>
+    <div class="note">Les transmissions sont class&eacute;es dans les archives internes du royaume.</div>
+    <a class="back" href="/">&larr; Retour au forum du ch&acirc;teau</a>
+  </main>
+</body>
+</html>

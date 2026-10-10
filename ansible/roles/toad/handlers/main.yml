@@ -1,0 +1,45 @@
+---
+- name: netplan apply
+  command: netplan apply
+
+- name: reload nftables
+  systemd:
+    name: nftables
+    state: restarted
+
+- name: restart smbd
+  systemd:
+    name: smbd
+    state: restarted
+
+- name: reload apache2
+  systemd:
+    name: apache2
+    state: reloaded
+
+- name: restart apache2
+  systemd:
+    name: apache2
+    state: restarted
+
+- name: restart dnsmasq
+  systemd:
+    name: dnsmasq
+    state: restarted
+
+- name: restart systemd-resolved
+  systemd:
+    name: systemd-resolved
+    state: restarted
+
+- name: restart systemd-journald
+  systemd:
+    name: systemd-journald
+    state: restarted
+
+- name: recharger systemd et activer disk-guard
+  systemd:
+    name: disk-guard.timer
+    daemon_reload: true
+    enabled: true
+    state: started

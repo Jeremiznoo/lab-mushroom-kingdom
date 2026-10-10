@@ -1,0 +1,753 @@
+---
+# TOAD-MUSHROOM : foothold + pivot + passerelle (sans forwarding) du lab.
+# Idempotent : rejouable sans effet de bord sur un état déjà en place.
+
+# --- Second disque : /mnt/data ------------------------------------------
+# Le disque racine (2.4G) est déjà presque entièrement occupé par l'OS seul
+# (testé et vécu plusieurs fois : saturé à 100% par l'OS + apt + webroot).
+# Tout ce qui grossit (webroot, partage Samba, ET le cache apt lui-même —
+# /var/lib/apt/lists fait à lui seul ~200M et a provoqué une saturation en
+# plein milieu d'un apt-get update) vit sur ce second disque (10G), monté de
+# façon permanente (fstab, par UUID pour survivre à un redémarrage). Ce bloc
+# doit impérativement s'exécuter AVANT l'installation des paquets.
+- name: Point de montage {{ toad_data_mount }}
+  file:
+    path: "{{ toad_data_mount }}"
+    state: directory
+    mode: "0755"
+  tags: [toad, deploy]
+
+- name: Monter durablement le second disque (DATADISK)
+  ansible.posix.mount:
+    path: "{{ toad_data_mount }}"
+    src: "UUID={{ toad_data_disk_uuid }}"
+    fstype: ext4
+    state: mounted
+  tags: [toad, deploy]
+
+- name: Migrer un éventuel ancien webroot sur / vers le second disque
+  command: mv /var/www/mission-board {{ toad_webroot }}
+  args:
+    creates: "{{ toad_webroot }}"
+    removes: /var/www/mission-board
+  tags: [toad, deploy]
+
+- name: Migrer un éventuel ancien partage Samba sur / vers le second disque
+  command: mv /srv/samba/transfer {{ toad_samba_share_path }}
+  args:
+    creates: "{{ toad_samba_share_path }}"
+    removes: /srv/samba/transfer
+  tags: [toad, deploy]
+
+- name: Répertoires cache apt sur le second disque
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ toad_data_mount }}/apt-lists"
+    - "{{ toad_data_mount }}/apt-cache"
+  tags: [toad, deploy]
+
+# mountpoint-based, pas "creates:", pour ne jamais tenter un rsync source==
+# destination (source == destination dès que le bind-mount est déjà en
+# place, ce que rsync --remove-source-files refuse de faire : rc=23).
+- name: Vérifier si /var/lib/apt/lists est déjà bind-monté
+  command: mountpoint -q /var/lib/apt/lists
+  register: _apt_lists_already_mounted
+  failed_when: false
+  changed_when: false
+  tags: [toad, deploy]
+
+- name: Migrer le contenu actuel de /var/lib/apt/lists avant bind-mount
+  command: >-
+    rsync -a --remove-source-files /var/lib/apt/lists/
+    {{ toad_data_mount }}/apt-lists/
+  when: _apt_lists_already_mounted.rc != 0
+  tags: [toad, deploy]
+
+- name: Bind-mount /var/lib/apt/lists -> second disque
+  ansible.posix.mount:
+    path: /var/lib/apt/lists
+    src: "{{ toad_data_mount }}/apt-lists"
+    fstype: none
+    opts: bind
+    state: mounted
+  tags: [toad, deploy]
+
+# On redirige TOUT /var/cache/apt (pas seulement archives/) : les fichiers
+# de cache binaire d'APT (pkgcache.bin, srcpkgcache.bin) vivent directement
+# dans /var/cache/apt/ et peuvent, à eux seuls, saturer le disque racine
+# après plusieurs runs interrompus (des copies temporaires .bin.XXXXXX
+# abandonnées s'y sont déjà accumulées en pratique sur ce lab).
+# Nettoyage défensif d'un ancien schéma (bind-mount ou symlink manuel sur
+# /var/cache/apt/archives) qui empêcherait le bind-mount propre de tout
+# /var/cache/apt ci-dessous.
+- name: Vérifier si /var/cache/apt/archives est encore bind-monté seul (ancien schéma)
+  command: mountpoint -q /var/cache/apt/archives
+  register: _apt_archives_old_mount
+  failed_when: false
+  changed_when: false
+  tags: [toad, deploy]
+
+- name: Démonter l'ancien bind-mount /var/cache/apt/archives (remplacé par /var/cache/apt entier)
+  ansible.posix.mount:
+    path: /var/cache/apt/archives
+    state: unmounted
+  when: _apt_archives_old_mount.rc == 0
+  tags: [toad, deploy]
+
+- name: Retirer un éventuel symlink résiduel /var/cache/apt/archives
+  ansible.builtin.file:
+    path: /var/cache/apt/archives
+    state: absent
+  when: _apt_archives_old_mount.rc == 0
+  tags: [toad, deploy]
+
+- name: Vérifier si /var/cache/apt est déjà bind-monté
+  command: mountpoint -q /var/cache/apt
+  register: _apt_cache_already_mounted
+  failed_when: false
+  changed_when: false
+  tags: [toad, deploy]
+
+- name: Migrer le contenu actuel de /var/cache/apt avant bind-mount
+  command: >-
+    rsync -a --remove-source-files /var/cache/apt/
+    {{ toad_data_mount }}/apt-cache/
+  when: _apt_cache_already_mounted.rc != 0
+  tags: [toad, deploy]
+
+- name: Bind-mount /var/cache/apt -> second disque
+  ansible.posix.mount:
+    path: /var/cache/apt
+    src: "{{ toad_data_mount }}/apt-cache"
+    fstype: none
+    opts: bind
+    state: mounted
+  tags: [toad, deploy]
+
+# `package_facts` interroge juste dpkg (aucune écriture disque, contrairement
+# à `apt-get update`) : on ne rafraîchit le cache apt (gros consommateur
+# d'espace sur un disque racine de 2.4G déjà serré) que si un paquet manque
+# réellement, jamais à chaque run une fois le lab provisionné une première fois.
+- name: Vérifier les paquets déjà installés
+  ansible.builtin.package_facts:
+    manager: apt
+  tags: [toad, deploy]
+
+- name: Paquets requis (réseau, pare-feu, Samba, PHP/Apache, cron, DNS, SQLite)
+  apt:
+    name:
+      - nftables
+      - samba
+      - apache2
+      - php
+      - libapache2-mod-php
+      - php-sqlite3
+      - cron
+      - dnsmasq
+    state: present
+    update_cache: "{{ not (['nftables','samba','apache2','php','libapache2-mod-php','php-sqlite3','cron','dnsmasq'] | difference(ansible_facts.packages.keys() | list) | length == 0) }}"
+    cache_valid_time: 86400
+  tags: [toad, deploy]
+
+# systemd-resolved occupe le port 53 par défaut sur Ubuntu -> conflit avec
+# dnsmasq. On le laisse résoudre via sa stub locale (127.0.0.53) pour TOAD
+# lui-même, mais on l'empêche d'écouter sur les interfaces réseau pour
+# libérer le port 53 externe pour dnsmasq.
+- name: Désactiver l'écoute réseau de systemd-resolved (libère le port 53)
+  lineinfile:
+    path: /etc/systemd/resolved.conf
+    regexp: '^#?DNSStubListener='
+    line: 'DNSStubListener=no'
+  notify: restart systemd-resolved
+  tags: [toad, deploy]
+
+# Sans le stub (127.0.0.53:53), /etc/resolv.conf doit pointer directement
+# sur le resolv.conf "non-stub" généré par systemd-resolved, sinon TOAD
+# perd sa propre résolution DNS (apt, etc.).
+- name: Repointer /etc/resolv.conf sur le resolv.conf non-stub
+  file:
+    src: /run/systemd/resolve/resolv.conf
+    dest: /etc/resolv.conf
+    state: link
+    force: true
+  tags: [toad, deploy]
+
+# --- Réseau -----------------------------------------------------------
+- name: Désactiver la régénération réseau par cloud-init
+  template:
+    src: 99-disable-network-config.cfg.j2
+    dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [toad, deploy]
+
+- name: Configuration netplan (ens3 DHCP / ens4 statique interne)
+  # Cible le fichier déjà généré par cloud-init au premier boot (ne pas créer
+  # un second fichier netplan concurrent) : /etc/netplan/50-cloud-init.yaml.
+  template:
+    src: 50-cloud-init.yaml.j2
+    dest: /etc/netplan/50-cloud-init.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  notify: netplan apply
+  tags: [toad, deploy]
+
+# --- Pare-feu -----------------------------------------------------------
+- name: net.ipv4.ip_forward=0 (Toad ne route pas entre DMZ et château)
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "0"
+    sysctl_set: true
+    state: present
+    reload: true
+  tags: [toad, deploy]
+
+- name: Déployer la règle nftables persistante
+  template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload nftables
+  tags: [toad, deploy]
+
+- name: Activer nftables au boot
+  systemd:
+    name: nftables
+    enabled: true
+    state: started
+  tags: [toad, deploy]
+
+# --- DNS : mushroomkingdom.local (+ sous-domaine caché forum.*) ----------
+# Le site n'étant servi par Apache que pour Host: forum.mushroomkingdom.local
+# (voir plus bas), l'auditeur doit :
+#   1. Scanner, repérer le DNS sur un port non standard (53 intercepté par
+#      l'infra réseau CloudStack).
+#   2. Faire une résolution inverse (PTR) de l'IP connue -> révèle l'apex
+#      "mushroomkingdom.local" (host-record génère le PTR automatiquement).
+#   3. Énumérer les sous-domaines de cet apex (wordlist subdomains-*, ex.
+#      SecLists) -> "forum" est le seul qui résout (en DNS) / répond
+#      différemment (en HTTP, vhost fuzzing sur le Host).
+#   4. Résoudre forum.mushroomkingdom.local lui-même (hosts file local, ce
+#      nom n'existe dans aucun DNS public) pour accéder au vrai site.
+- name: Déployer la configuration dnsmasq pour mushroomkingdom.local
+  template:
+    src: dnsmasq-mushroomkingdom.conf.j2
+    dest: /etc/dnsmasq.d/mushroomkingdom.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart dnsmasq
+  tags: [toad, deploy]
+
+- name: Nettoyer l'ancienne config dnsmasq thetoadforums.local
+  file:
+    path: /etc/dnsmasq.d/thetoadforums.conf
+    state: absent
+  notify: restart dnsmasq
+  tags: [toad, deploy]
+
+- name: Désactiver dnsmasq-base générique (on gère tout via dnsmasq.d)
+  lineinfile:
+    path: /etc/dnsmasq.conf
+    regexp: '^#?conf-dir='
+    line: 'conf-dir=/etc/dnsmasq.d/,*.conf'
+  notify: restart dnsmasq
+  tags: [toad, deploy]
+
+- name: Activer dnsmasq au boot
+  systemd:
+    name: dnsmasq
+    enabled: true
+    state: started
+  tags: [toad, deploy]
+
+# --- Samba (transfert interne fiable, jamais de python http.server) -----
+- name: Compte système dédié au partage Samba
+  user:
+    name: "{{ toad_samba_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    state: present
+  tags: [toad, deploy]
+
+- name: Répertoire de partage Samba
+  file:
+    path: "{{ toad_samba_share_path }}"
+    state: directory
+    owner: "{{ toad_samba_user }}"
+    group: "{{ toad_samba_user }}"
+    mode: "0750"
+  tags: [toad, deploy]
+
+- name: Mot de passe Samba (idempotent via smbpasswd -e après set)
+  shell: |
+    set -e
+    (echo "{{ toad_samba_password }}"; echo "{{ toad_samba_password }}") | smbpasswd -s -a {{ toad_samba_user }}
+    smbpasswd -e {{ toad_samba_user }}
+  args:
+    executable: /bin/bash
+  changed_when: false
+  no_log: true
+  tags: [toad, deploy]
+
+- name: Configuration Samba
+  template:
+    src: smb.conf.j2
+    dest: /etc/samba/smb.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart smbd
+  tags: [toad, deploy]
+
+- name: Activer Samba au boot
+  systemd:
+    name: smbd
+    enabled: true
+    state: started
+  tags: [toad, deploy]
+
+# --- Authentification réelle (SQLite) ------------------------------------
+# Seul moyen légitime d'obtenir un compte : les identifiants que Captain
+# Toad "laisse fuiter" quand on lui parle d'un flag (et que le fil du forum
+# honeypot mentionne aussi). Les inscriptions sont désactivées côté PHP
+# (pages/login.php) -> impossible de créer un compte soi-même. La base vit
+# hors du webroot, jamais accessible en HTTP.
+- name: Dossier de données hors webroot pour la base d'authentification
+  file:
+    path: "{{ toad_data_mount }}/missionboard-data"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0750"
+  tags: [toad, deploy]
+
+# "DELETE puis INSERT" plutôt que "INSERT OR IGNORE" : reste idempotent même
+# si mkb_honeypot_username change d'un déploiement à l'autre (un seul compte
+# valide doit exister, jamais un ancien identifiant qui traînerait en plus).
+- name: Initialiser la base SQLite et le compte honeypot (idempotent)
+  ansible.builtin.command:
+    argv:
+      - php
+      - -r
+      - >-
+        $pdo = new PDO("sqlite:{{ toad_data_mount }}/missionboard-data/users.db");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)");
+        $pdo->exec("DELETE FROM users");
+        $stmt = $pdo->prepare("INSERT INTO users (username, password_hash) VALUES (:u, :p)");
+        $stmt->execute(["u" => "{{ mkb_honeypot_username }}", "p" => password_hash("{{ mkb_honeypot_password }}", PASSWORD_DEFAULT)]);
+  changed_when: false
+  no_log: true
+  tags: [toad, deploy]
+
+- name: Permissions sur la base SQLite
+  file:
+    path: "{{ toad_data_mount }}/missionboard-data/users.db"
+    owner: www-data
+    group: www-data
+    mode: "0640"
+  tags: [toad, deploy]
+
+- name: Webroot du Mission Board
+  file:
+    path: "{{ toad_webroot }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+  tags: [toad, deploy]
+
+- name: Déployer le code du Mission Board
+  copy:
+    src: webapp/
+    dest: "{{ toad_webroot }}/"
+    owner: www-data
+    group: www-data
+    directory_mode: "0755"
+    mode: "0644"
+  tags: [toad, deploy]
+
+- name: Supprimer l'ancien fichier indice (obsolète, découverte via source index.php désormais)
+  file:
+    path: /opt/mission-board-notes.txt
+    state: absent
+  tags: [toad, deploy]
+
+- name: Supprimer l'ancienne page de session poisoning (obsolète, RCE via log poisoning désormais)
+  file:
+    path: "{{ toad_webroot }}/pages/hero-console-x7f3a9d2.php"
+    state: absent
+  tags: [toad, deploy]
+
+- name: Supprimer l'ancien log dédié du vhost (obsolète)
+  file:
+    path: "/var/log/apache2/mission-board-access.log"
+    state: absent
+  tags: [toad, deploy]
+
+# allow_url_include = On : misconfiguration volontaire et classique (le
+# cousin de Lemmy a copié une config PHP trouvée sur un forum). Combinée à
+# la LFI deja authentifiee, elle permet le wrapper data:// -> RCE directe,
+# sans rien ecrire sur le disque ni manipuler cookies/headers.
+- name: allow_url_include = On (RCE directe via wrapper data:// sur la LFI)
+  lineinfile:
+    path: /etc/php/8.3/apache2/php.ini
+    regexp: '^allow_url_include\s*='
+    line: "allow_url_include = On"
+  notify: restart apache2
+  tags: [toad, deploy]
+
+- name: Nettoyer l'ancien vhost non numéroté (remplacé par 000-/010-)
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apache2/sites-available/mission-board.conf
+    - /etc/apache2/sites-enabled/mission-board.conf
+  notify: reload apache2
+  tags: [toad, deploy]
+
+# --- Vhosting par nom : le site n'est servi QUE pour Host: forum.mushroomkingdom.local
+# Un accès direct par IP (ou avec n'importe quel autre Host, y compris
+# l'apex mushroomkingdom.local lui-même) tombe sur le vhost "catch-all"
+# ci-dessous (premier chargé par ordre alphabétique = vhost par défaut
+# d'Apache pour toute requête sans correspondance de ServerName). L'auditeur
+# doit donc : repérer le DNS -> PTR sur l'IP -> apex mushroomkingdom.local ->
+# énumération de sous-domaines (wordlist) -> "forum" -> résoudre ce nom
+# lui-même pour accéder au vrai site.
+- name: Page vitrine pour les accès par IP (decoy, clin d'œil Mario)
+  copy:
+    dest: /var/www/html/index.html
+    src: "{{ playbook_dir }}/../landing/index.html"
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [toad, deploy]
+
+- name: Image de la princesse dans un autre château pour la landing IP
+  copy:
+    src: "{{ playbook_dir }}/../img/Super_Mario_Bros_Princess_Is_In_Another_Castle_Quote.png"
+    dest: /var/www/html/Super_Mario_Bros_Princess_Is_In_Another_Castle_Quote.png
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [toad, deploy]
+
+- name: VirtualHost catch-all (répond à tout Host non reconnu)
+  copy:
+    dest: /etc/apache2/sites-available/000-catchall.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Géré par Ansible (rôle toad). Chargé en premier (000-) -> devient le
+      # vhost par défaut pour toute requête dont le Host ne correspond à
+      # aucun ServerName/ServerAlias déclaré ailleurs (y compris un accès
+      # direct par adresse IP).
+      <VirtualHost *:80>
+          ServerName _default_
+          DocumentRoot /var/www/html
+          ErrorLog ${APACHE_LOG_DIR}/catchall-error.log
+          CustomLog ${APACHE_LOG_DIR}/catchall-access.log combined
+      </VirtualHost>
+  notify: reload apache2
+  tags: [toad, deploy]
+
+# Requis pour la directive Header ci-dessous.
+- name: Activer mod_headers
+  community.general.apache2_module:
+    name: headers
+    state: present
+  notify: restart apache2
+  tags: [toad, deploy]
+
+- name: VirtualHost Mission Board (uniquement Host forum.mushroomkingdom.local)
+  copy:
+    dest: /etc/apache2/sites-available/010-mission-board.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Géré par Ansible (rôle toad). Contenu applicatif NON géré ici.
+      <VirtualHost *:80>
+          ServerName forum.mushroomkingdom.local
+          DocumentRoot {{ toad_webroot }}
+          <Directory {{ toad_webroot }}>
+              AllowOverride All
+              Require all granted
+          </Directory>
+          # Lab en évolution permanente : on désactive le cache navigateur sur
+          # les assets pour ne jamais avoir à expliquer un "hard refresh" à
+          # chaque mise à jour de app.js/CSS.
+          <FilesMatch "\.(js|css)$">
+              Header set Cache-Control "no-cache, no-store, must-revalidate"
+              Header set Pragma "no-cache"
+              Header set Expires 0
+          </FilesMatch>
+          ErrorLog ${APACHE_LOG_DIR}/mission-board-error.log
+          # Pas de CustomLog dedie : ce vhost retombe sur le log global Ubuntu
+          # par defaut (other_vhosts_access.log, deja active via
+          # conf-enabled/other-vhosts-access-log.conf), chemin standard et
+          # connu plutot qu'un nom de fichier personnalise a decouvrir.
+      </VirtualHost>
+  notify: reload apache2
+  tags: [toad, deploy]
+
+- name: Activer les vhosts catch-all + mission-board, désactiver le default Debian
+  shell: |
+    a2dissite 000-default >/dev/null 2>&1 || true
+    a2ensite 000-catchall >/dev/null 2>&1 || true
+    a2ensite 010-mission-board >/dev/null 2>&1 || true
+  changed_when: false
+  tags: [toad, deploy]
+
+- name: Activer Apache au boot
+  systemd:
+    name: apache2
+    enabled: true
+    state: started
+  tags: [toad, deploy]
+
+# Les logs Apache (access + error, tous vhosts) ont déjà fait planter
+# l'authentification du Mission Board en remplissant le disque racine à 100%
+# (session PHP écrite à 0 octet faute de place) après un usage intensif en
+# tests. Même traitement que apt-lists/apt-cache plus haut : bind-mount sur
+# le second disque, largement assez grand.
+- name: Répertoire logs Apache sur le second disque
+  file:
+    path: "{{ toad_data_mount }}/apache-logs"
+    state: directory
+    mode: "0750"
+    owner: root
+    group: adm
+  tags: [toad, deploy]
+
+- name: Vérifier si /var/log/apache2 est déjà bind-monté
+  command: mountpoint -q /var/log/apache2
+  register: _apache_logs_already_mounted
+  failed_when: false
+  changed_when: false
+  tags: [toad, deploy]
+
+- name: Migrer le contenu actuel de /var/log/apache2 avant bind-mount
+  command: >-
+    rsync -a --remove-source-files /var/log/apache2/
+    {{ toad_data_mount }}/apache-logs/
+  when: _apache_logs_already_mounted.rc != 0
+  tags: [toad, deploy]
+
+- name: Bind-mount /var/log/apache2 -> second disque
+  ansible.posix.mount:
+    path: /var/log/apache2
+    src: "{{ toad_data_mount }}/apache-logs"
+    fstype: none
+    opts: bind
+    state: mounted
+  notify: restart apache2
+  tags: [toad, deploy]
+
+# journald n'avait aucune limite de taille (déjà 70M+ constatés, sans
+# plafond). PHPSessionclean tourne déjà par défaut toutes les 30 min, mais
+# rien ne bornait journald -> on fixe un plafond dur.
+- name: Plafonner la taille de journald (évite une dérive sur le disque racine)
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/journald.conf
+    regexp: "^#?SystemMaxUse="
+    line: "SystemMaxUse=100M"
+  notify: restart systemd-journald
+  tags: [toad, deploy]
+
+# Garde-fou de dernier recours : si malgré tout le disque racine venait à se
+# remplir en pleine session d'examen (nouvelle cause non anticipée), ce
+# timer vide journald et nettoie les sessions PHP orphelines avant que ça ne
+# recasse l'authentification comme ça a déjà été le cas.
+- name: Script garde-fou anti-saturation disque racine
+  copy:
+    dest: /usr/local/sbin/disk-guard.sh
+    owner: root
+    group: root
+    mode: "0750"
+    content: |
+      #!/bin/bash
+      # Garde-fou : si / dépasse 85%, on libère de la place sans intervention
+      # manuelle (journald, sessions PHP vides, vieux fichiers dans /tmp).
+      set -euo pipefail
+      USAGE=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+      if [ "$USAGE" -ge 85 ]; then
+          logger -t disk-guard "root filesystem a ${USAGE}%, nettoyage"
+          journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+          find /var/lib/php/sessions -type f -empty -delete 2>/dev/null || true
+          find /tmp -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
+      fi
+  tags: [toad, deploy]
+
+- name: Timer systemd pour le garde-fou (toutes les 10 min)
+  copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: disk-guard.service
+      content: |
+        [Unit]
+        Description=Garde-fou anti-saturation disque racine
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/disk-guard.sh
+    - name: disk-guard.timer
+      content: |
+        [Unit]
+        Description=Lance disk-guard.service toutes les 10 minutes
+
+        [Timer]
+        OnBootSec=5min
+        OnUnitActiveSec=10min
+
+        [Install]
+        WantedBy=timers.target
+  notify: recharger systemd et activer disk-guard
+  tags: [toad, deploy]
+
+# --- Privesc Linux : coffre KeePass volontairement faible + sudo vim -----
+- name: Supprimer l'ancien cron root (obsolète, remplacé par le coffre KeePass)
+  file:
+    path: /etc/cron.d/mushroom-backup
+    state: absent
+  tags: [toad, deploy]
+
+- name: Supprimer l'ancien script backup.sh inscriptible (obsolète)
+  file:
+    path: /opt/scripts/backup.sh
+    state: absent
+  tags: [toad, deploy]
+
+- name: Supprimer les anciennes archives générées par le cron obsolète
+  shell: rm -f /var/backups/mission-board-*.tar.gz
+  changed_when: false
+  tags: [toad, deploy]
+
+# Toadette a laissé une sauvegarde de son coffre perso dans /var/backups,
+# oubliée après une réinstallation de poste. Le KDF du coffre a été affaibli
+# volontairement (Argon2 avec des paramètres dérisoires) : cassable en
+# quelques millisecondes par essai avec keepass2john + john, le mot de passe
+# maître (princess1) étant lui-même dans les wordlists courantes (rockyou).
+# Le coffre contient le vrai mot de passe Linux de toadette, qui a une règle
+# sudo NOPASSWD sur /usr/bin/vim -> root direct via GTFOBins.
+- name: /var/backups existe
+  file:
+    path: /var/backups
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [toad, deploy]
+
+- name: Compte système toadette
+  user:
+    name: toadette
+    password: "{{ toadette_password | password_hash('sha512') }}"
+    # Shell de login = vim lui-meme (a la Dante) : des qu'on bascule sur ce
+    # compte, vim s'ouvre instantanement. Il faut un vim escape juste pour
+    # obtenir un shell utilisable en tant que toadette, avant meme de
+    # pouvoir faire le sudo -l qui mene a root.
+    shell: /usr/bin/vim
+    create_home: true
+  tags: [toad, deploy]
+
+# Quand $SHELL=/usr/bin/vim (son propre shell de login), vim utilise cette
+# valeur par defaut pour ':!' et ':shell', et essaie donc de se relancer
+# lui-meme au lieu d'un vrai shell (E492: Not an editor command). On force
+# l'option 'shell' pour que l'escape standard GTFOBins marche directement.
+- name: .vimrc de toadette (force shell=/bin/sh pour que l'escape GTFOBins marche direct)
+  copy:
+    dest: /home/toadette/.vimrc
+    owner: toadette
+    group: toadette
+    mode: "0644"
+    content: |
+      set shell=/bin/sh
+  tags: [toad, deploy]
+
+- name: sudoers toadette (NOPASSWD vim -> root, GTFOBins)
+  copy:
+    dest: /etc/sudoers.d/toadette
+    owner: root
+    group: root
+    mode: "0440"
+    content: |
+      toadette ALL=(root) NOPASSWD: /usr/bin/vim
+    validate: "visudo -cf %s"
+  tags: [toad, deploy]
+
+- name: Coffre KeePass de toadette (nom et propriétaire neutres, ne révèlent pas l'utilisateur visé)
+  copy:
+    src: keepass-backup.kdbx
+    dest: /var/backups/keepass-backup.kdbx
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [toad, deploy]
+
+# --- Hygiène : aucune trace de nos propres commandes de setup/test --------
+- name: Historique bash désactivé globalement (login shells)
+  copy:
+    dest: /etc/profile.d/99-no-history.sh
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      export HISTFILE=/dev/null
+      export HISTSIZE=0
+      export HISTFILESIZE=0
+  tags: [toad, deploy]
+
+- name: Historique bash désactivé globalement (shells non-login, ex. su sans -)
+  blockinfile:
+    path: /etc/bash.bashrc
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - no-history"
+    block: |
+      export HISTFILE=/dev/null
+      export HISTSIZE=0
+      export HISTFILESIZE=0
+  tags: [toad, deploy]
+
+- name: Purger les historiques déjà écrits pendant nos tests
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /root/.bash_history
+    - /home/ubuntu/.bash_history
+    - /home/toadette/.bash_history
+  tags: [toad, deploy]
+
+# --- Pivot : indice trouvé après la privesc, PAS avant -------------------
+- name: /root/castle_access.txt (lisible uniquement par root)
+  template:
+    src: castle_access.txt.j2
+    dest: /root/castle_access.txt
+    owner: root
+    group: root
+    mode: "0600"
+  tags: [toad, deploy]
+
+# --- Ambiance ------------------------------------------------------------
+- name: MOTD thématique
+  template:
+    src: motd.j2
+    dest: /etc/motd
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [toad, deploy]

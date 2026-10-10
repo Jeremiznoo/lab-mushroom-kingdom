@@ -1,0 +1,33 @@
+---
+# Playbook principal — Lab Mushroom Kingdom.
+# Jouer par tags (voir README) : --tags toad / koopalings / bowser / lockdown
+#
+# IMPORTANT : ne PAS mettre de "tags:" au niveau des plays ci-dessous. Un tag
+# de play s'applique en plus à TOUTES les tâches du rôle, y compris celles
+# tagguées [lockdown] — ce qui ferait fermer WinRM à chaque déploiement
+# ordinaire au lieu de seulement juste avant une session d'examen. Les tags
+# sont donc portés uniquement par les tâches elles-mêmes, dans les rôles.
+
+- name: TOAD-MUSHROOM — foothold, pivot, passerelle
+  hosts: toad-mushroom
+  become: true
+  vars_files:
+    - group_vars/credentials.yml
+  roles:
+    - toad
+
+# Joué AVANT koopalings : synchronise le mot de passe AD de svc_bowser_jr
+# (voir rôle bowser) dont dépend le pool applicatif IIS créé juste après.
+- name: DC-BOWSER-KINGDOM — vérification, durcissement, flag final
+  hosts: dc-bowser-kingdom
+  vars_files:
+    - group_vars/credentials.yml
+  roles:
+    - bowser
+
+- name: KOOPALINGS-CASTLE — IIS, pool applicatif, upload non restreint
+  hosts: koopalings-castle
+  vars_files:
+    - group_vars/credentials.yml
+  roles:
+    - koopalings

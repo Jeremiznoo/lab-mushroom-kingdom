@@ -1,0 +1,14 @@
+# Géré par Ansible (rôle toad) — NE PAS éditer à la main.
+# ens3 : DMZ, DHCP — seule interface qui sort du royaume (vers CloudStack/Internet lab).
+# ens4 : réseau interne du château, 10.10.20.0/24, statique — Toad fait le guet ici.
+network:
+  version: 2
+  ethernets:
+    ens3:
+      dhcp4: true
+    ens4:
+      dhcp4: false
+      addresses:
+        - "{{ toad_internal_ip }}/{{ toad_internal_prefix }}"
+      # Pas de gateway ni de nameservers ici : ens4 est un cul-de-sac volontaire,
+      # TOAD ne doit PAS router entre DMZ et interne (voir net.ipv4.ip_forward=0).
